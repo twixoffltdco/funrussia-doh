@@ -1,23 +1,23 @@
-/**
- * FUN RUSSIA — DNS-over-HTTPS (для Layero light / без UDP 53)
- * Production endpoint: https://funrussia-doh.layero.dev/dns-query
- * Game server: 185.207.214.14:7785
- * funrussia-online.tatnet.app is the website and must not be hijacked to the game IP.
- */
 const express = require('express');
-const dgram = require('dgram');
 const dns2 = require('dns2');
 const { Packet } = dns2;
 
 const GAME_IP = process.env.GAME_IP || '185.207.214.14';
 const PORT = Number(process.env.PORT || 3000);
-const HIJACK = (process.env.HIJACK || 'blackrussia.online,br1.fun')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const UPSTREAM_DOH = process.env.UPSTREAM_DOH || 'https://cloudflare-dns.com/dns-query';
+
+// Safe default: do not hijack official service domains.
+// Set HIJACK only after verifying a hostname is used exclusively for game traffic.
+const BLOCKED_HIJACK_HOSTS = new Set(['blackrussia.online', 'br1.fun']);
+const HIJACK = (process.env.HIJACK || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase().replace(/\.$/, ''))
+  .filter(s => Boolean(s) && !BLOCKED_HIJACK_HOSTS.has(s));
 
 function shouldHijack(name) {
   const n = String(name || '').toLowerCase().replace(/\.$/, '');
-  return HIJACK.some(s => n === s || n.endsWith('.' + s));
+  // Exact host match only; never redirect every subdomain.
+  return HIJACK.includes(n);
 }
 
 function buildAResponse(requestPacket, name) {
@@ -26,11 +26,8 @@ function buildAResponse(requestPacket, name) {
   response.header.ra = 1;
   response.header.rd = 1;
   response.answers = [{
-    name,
-    type: Packet.TYPE.A,
-    class: Packet.CLASS.IN,
-    ttl: 30,
-    address: GAME_IP,
+    name, type: Packet.TYPE.A, class: Packet.CLASS.IN,
+    ttl: 30, address: GAME_IP,
   }];
   return response.toBuffer();
 }
@@ -58,25 +55,19 @@ async function forwardDoH(buf) {
 
 function handleDnsWire(buf) {
   let packet;
-  try {
-    packet = Packet.parse(buf);
-  } catch {
-    return null;
-  }
+  try { packet = Packet.parse(buf); } catch { return null; }
   const q = packet.questions && packet.questions[0];
   if (!q) return null;
-  const name = q.name;
-  const qtype = q.type;
 
-  if (shouldHijack(name) && qtype === Packet.TYPE.A) {
-    console.log('[HIJACK A]', name, '->', GAME_IP);
-    return buildAResponse(packet, name);
+  if (shouldHijack(q.name) && q.type === Packet.TYPE.A) {
+    console.log('[HIJACK A]', q.name, '->', GAME_IP);
+    return buildAResponse(packet, q.name);
   }
-  if (shouldHijack(name) && qtype === Packet.TYPE.AAAA) {
-    console.log('[HIJACK AAAA]', name, 'empty');
+  if (shouldHijack(q.name) && q.type === Packet.TYPE.AAAA) {
+    console.log('[HIJACK AAAA]', q.name, 'empty');
     return buildEmptyResponse(packet);
   }
-  return null; // forward
+  return null;
 }
 
 const app = express();
@@ -88,13 +79,14 @@ app.get('/', (_req, res) => {
 <body style="font-family:system-ui;background:#0b0b0d;color:#fff;padding:2rem">
 <h1>FUN RUSSIA DoH</h1>
 <p>DNS-over-HTTPS для iOS. Endpoint: <code>/dns-query</code></p>
-<p>Game IP: <b>${GAME_IP}</b></p>
+<p>Game server: <b>${GAME_IP}:7785</b></p>
+<p>Hijack hosts: <b>${HIJACK.length ? HIJACK.join(', ') : 'none (safe default)'}</b></p>
 <p>OK</p></body>`);
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, game: GAME_IP, hijack: HIJACK }));
+app.get('/health', (_req, res) =>
+  res.json({ ok: true, game: GAME_IP, hijack: HIJACK }));
 
-// RFC 8484 GET ?dns=base64url
 app.get('/dns-query', async (req, res) => {
   try {
     let buf;
@@ -103,27 +95,22 @@ app.get('/dns-query', async (req, res) => {
       while (b64.length % 4) b64 += '=';
       buf = Buffer.from(b64, 'base64');
     } else if (req.query.name) {
-      // convenience JSON-ish debug via wire build
       const name = String(req.query.name);
       const packet = new Packet();
       packet.header.id = 0x1234;
       packet.header.rd = 1;
       packet.questions = [{ name, type: Packet.TYPE.A, class: Packet.CLASS.IN }];
-      buf = packet.toBuffer();
-      const hijacked = handleDnsWire(buf);
-      if (hijacked) {
-        // for debug return json
-        return res.json({ name, address: GAME_IP, hijacked: true });
-      }
-      return res.json({ name, hijacked: false, note: 'forward only via POST wire format' });
+      const hijacked = handleDnsWire(packet.toBuffer());
+      if (hijacked) return res.json({ name, address: GAME_IP, hijacked: true });
+      return res.json({ name, hijacked: false, note: 'Normal DNS is forwarded through upstream DoH.' });
     } else {
       return res.status(400).send('need dns= or name=');
     }
 
     const hijacked = handleDnsWire(buf);
-    const out = hijacked || await forwardDoH(buf);
+    const result = hijacked || await forwardDoH(buf);
     res.set('content-type', 'application/dns-message');
-    res.send(out);
+    res.send(result);
   } catch (e) {
     console.error(e);
     res.status(502).send('bad gateway');
@@ -135,9 +122,9 @@ app.post('/dns-query', async (req, res) => {
     const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || []);
     if (!buf.length) return res.status(400).send('empty');
     const hijacked = handleDnsWire(buf);
-    const out = hijacked || await forwardDoH(buf);
+    const result = hijacked || await forwardDoH(buf);
     res.set('content-type', 'application/dns-message');
-    res.send(out);
+    res.send(result);
   } catch (e) {
     console.error(e);
     res.status(502).send('bad gateway');
@@ -147,5 +134,5 @@ app.post('/dns-query', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log('FUN RUSSIA DoH on :' + PORT);
   console.log('GAME_IP=' + GAME_IP);
-  console.log('HIJACK=' + HIJACK.join(','));
+  console.log('HIJACK=' + (HIJACK.join(',') || '(disabled; safe default)'));
 });
