@@ -1,7 +1,8 @@
 /**
  * FUN RUSSIA — DNS-over-HTTPS (для Layero light / без UDP 53)
- * Деплой на https://funrussia.layero.dev
- * iOS профиль указывает ServerURL: https://funrussia.layero.dev/dns-query
+ * Production endpoint: https://funrussia-doh.layero.dev/dns-query
+ * Game server: 185.207.214.14:7785
+ * funrussia-online.tatnet.app is the website and must not be hijacked to the game IP.
  */
 const express = require('express');
 const dgram = require('dgram');
@@ -10,7 +11,7 @@ const { Packet } = dns2;
 
 const GAME_IP = process.env.GAME_IP || '185.207.214.14';
 const PORT = Number(process.env.PORT || 3000);
-const HIJACK = (process.env.HIJACK || 'blackrussia.online,br1.fun,funrussia.online')
+const HIJACK = (process.env.HIJACK || 'blackrussia.online,br1.fun')
   .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const UPSTREAM_DOH = process.env.UPSTREAM_DOH || 'https://cloudflare-dns.com/dns-query';
 
